@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "api/slack/events.ts": {
+      "runtime": "nodejs20.x",
+      "maxDuration": 60
+    }
+  }
+}
