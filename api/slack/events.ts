@@ -1,7 +1,20 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { waitUntil } from "@vercel/functions";
 import { verifySlackSignature } from "../../src/slack/verify.js";
 import { routeEvent } from "../../src/slack/router.js";
 import type { SlackEvent } from "../../src/slack/router.js";
+
+export const config = {
+  api: { bodyParser: false },
+};
+
+async function getRawBody(req: VercelRequest): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  }
+  return Buffer.concat(chunks).toString("utf-8");
+}
 
 export default async function handler(
   req: VercelRequest,
@@ -11,8 +24,19 @@ export default async function handler(
     return res.status(405).json({ error: "method not allowed" });
   }
 
-  const rawBody =
-    typeof req.body === "string" ? req.body : JSON.stringify(req.body);
+  const rawBody = await getRawBody(req);
+  const payload: SlackEvent = JSON.parse(rawBody);
+
+  // handle slack url verification challenge (before sig check)
+  if (payload.type === "url_verification") {
+    return res.status(200).json({ challenge: payload.challenge });
+  }
+
+  // skip slack retries
+  const retryNum = req.headers["x-slack-retry-num"];
+  if (retryNum) {
+    return res.status(200).json({ ok: true, skipped: "retry" });
+  }
 
   // verify signature
   const isValid = verifySlackSignature(
@@ -25,25 +49,13 @@ export default async function handler(
     return res.status(401).json({ error: "invalid signature" });
   }
 
-  const payload: SlackEvent =
-    typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-
-  // handle slack url verification challenge
-  if (payload.type === "url_verification") {
-    return res.status(200).json({ challenge: payload.challenge });
-  }
-
-  // acknowledge immediately, process async
-  // Vercel's waitUntil keeps the function alive after response
+  // acknowledge immediately, process async via waitUntil
   if (payload.type === "event_callback" && payload.event) {
-    // use waitUntil if available (Vercel), otherwise fire-and-forget
-    const processing = routeEvent(payload).catch((err) =>
-      console.error("event processing error:", err)
+    waitUntil(
+      routeEvent(payload).catch((err) =>
+        console.error("event processing error:", err)
+      )
     );
-
-    if (typeof globalThis !== "undefined" && "waitUntil" in globalThis) {
-      (globalThis as any).waitUntil(processing);
-    }
   }
 
   return res.status(200).json({ ok: true });

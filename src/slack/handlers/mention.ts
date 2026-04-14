@@ -1,6 +1,11 @@
-import { chat } from "../../ai/client.js";
+import { agenticLoop } from "../../ai/client.js";
+import { buildSystemPrompt } from "../../ai/system-prompt.js";
 import { getThreadHistory, appendToThread } from "../../store/redis.js";
-import { postMessage, addReaction } from "../messages.js";
+import { postMessage, addReaction } from "../client.js";
+import { getCoreMemory, formatCoreMemory } from "../../memory/core.js";
+import { recallMemories } from "../../memory/episodic.js";
+import { extractAndSaveMemories } from "../../memory/extract.js";
+import { log } from "../../log.js";
 
 type MentionEvent = {
   text?: string;
@@ -10,32 +15,56 @@ type MentionEvent = {
   ts?: string;
 };
 
+function extractTags(text: string): string[] {
+  // simple keyword extraction for memory retrieval
+  const words = text.toLowerCase().split(/\s+/);
+  return words
+    .filter((w) => w.length > 3)
+    .filter((w) => !["what", "when", "where", "which", "that", "this", "have", "been", "will", "from", "they", "their", "about", "would", "could", "should"].includes(w))
+    .slice(0, 5);
+}
+
 export async function handleMention(event: MentionEvent): Promise<void> {
   const { text, user, channel, thread_ts, ts } = event;
   if (!text || !channel || !ts) return;
 
-  // strip the @mention from the text
   const cleanText = text.replace(/<@[A-Z0-9]+>/g, "").trim();
   if (!cleanText) return;
 
-  // thread_ts: if this is already in a thread, use that; otherwise start a new thread from this message
   const threadTs = thread_ts ?? ts;
 
   try {
-    // show thinking indicator
     await addReaction(channel, ts, "eyes");
 
-    const history = await getThreadHistory(channel, threadTs);
-    const response = await chat(cleanText, history);
+    const [history, coreMemory, relevantMemories] = await Promise.all([
+      getThreadHistory(channel, threadTs),
+      getCoreMemory(),
+      recallMemories(extractTags(cleanText)),
+    ]);
+
+    const systemPrompt = buildSystemPrompt({
+      coreMemory: formatCoreMemory(coreMemory),
+      relevantMemories: relevantMemories.map((m) => m.fact),
+      triggerType: "mention",
+    });
+
+    log("MENTION", `user=${user} channel=${channel} memories=${relevantMemories.length} text="${cleanText.slice(0, 80)}"`);
+
+    const response = await agenticLoop({
+      systemPrompt,
+      userMessage: cleanText,
+      history,
+    });
 
     await postMessage(channel, response, threadTs);
     await appendToThread(channel, threadTs, cleanText, response);
-  } catch (err) {
-    console.error("mention handler error:", err);
-    await postMessage(
-      channel,
-      "kuch gadbad ho gayi, try again later",
-      threadTs
+
+    // async memory extraction — don't await, fire and forget
+    extractAndSaveMemories(cleanText, response, `${channel}:${threadTs}`).catch(
+      (err) => log("MENTION:EXTRACT_ERR", err)
     );
+  } catch (err) {
+    log("MENTION:ERROR", err);
+    await postMessage(channel, "kuch gadbad ho gayi, try again later", threadTs);
   }
 }

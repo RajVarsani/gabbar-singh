@@ -1,5 +1,8 @@
 import { handleMention } from "./handlers/mention.js";
 import { handleDM } from "./handlers/dm.js";
+import { handleObserve } from "./handlers/observe.js";
+import { isDuplicate } from "../store/redis.js";
+import { log } from "../log.js";
 
 export type SlackEvent = {
   type: string;
@@ -24,7 +27,15 @@ export async function routeEvent(payload: SlackEvent): Promise<void> {
   if (!event) return;
 
   // ignore bot messages to prevent loops
-  if (event.bot_id || event.subtype === "bot_message") return;
+  if (
+    event.bot_id ||
+    event.subtype === "bot_message" ||
+    event.subtype === "message_changed"
+  )
+    return;
+
+  // deduplicate slack retries
+  if (payload.event_id && (await isDuplicate(payload.event_id))) return;
 
   switch (event.type) {
     case "app_mention":
@@ -32,13 +43,17 @@ export async function routeEvent(payload: SlackEvent): Promise<void> {
       break;
 
     case "message":
-      // only handle DMs (im = direct message channel)
       if (event.channel_type === "im") {
         await handleDM(event);
+      } else if (
+        event.channel_type === "channel" ||
+        event.channel_type === "group"
+      ) {
+        await handleObserve(event);
       }
       break;
 
     default:
-      console.log(`unhandled event type: ${event.type}`);
+      log("ROUTER", `unhandled event type: ${event.type}`);
   }
 }
