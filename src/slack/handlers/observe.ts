@@ -4,7 +4,7 @@ import { buildSystemPrompt } from "../../ai/system-prompt.js";
 import { saveMemory } from "../../memory/episodic.js";
 import { getCoreMemory, formatCoreMemory } from "../../memory/core.js";
 import { recallMemories } from "../../memory/episodic.js";
-import { addReaction, postMessage } from "../client.js";
+import { postMessage } from "../client.js";
 import { redisGet, redisSet } from "../../store/redis.js";
 import { log } from "../../log.js";
 
@@ -19,8 +19,6 @@ type ChannelEvent = {
 const EXTRACT_PROMPT = `extract one factual memory from this slack message. respond with JSON (no markdown):
 {"fact": "...", "tags": ["tag1", "tag2"]}
 if nothing worth remembering, respond with: null`;
-
-const EMOJI_PROMPT = `pick ONE emoji reaction for this slack message. ONLY react if it's genuinely funny, a celebration, or a team win. respond with ONLY the emoji name (no colons). if it doesn't deserve a reaction, respond with: none`;
 
 const PROACTIVE_COOLDOWN = 600; // 10 minutes
 
@@ -59,21 +57,7 @@ export async function handleObserve(event: ChannelEvent): Promise<void> {
       return;
     }
 
-    case "react": {
-      try {
-        const emoji = await quickCall(EMOJI_PROMPT, text);
-        const cleanEmoji = emoji.trim().replace(/:/g, "").toLowerCase();
-        if (cleanEmoji && cleanEmoji !== "none" && cleanEmoji.length < 30) {
-          await addReaction(channel, ts, cleanEmoji);
-        }
-      } catch (err) {
-        log("OBSERVE:REACT_ERR", err);
-      }
-      return;
-    }
-
     case "proactive": {
-      // rate limit: max 1 proactive per channel per 10 min
       const cooldownKey = `gabbar:cooldown:${channel}`;
       const existing = await redisGet<number>(cooldownKey);
       if (existing) {
@@ -102,8 +86,8 @@ export async function handleObserve(event: ChannelEvent): Promise<void> {
           systemPrompt,
           userMessage: text,
           history: [],
-          maxIterations: 5, // keep it short for proactive
-          timeBudgetMs: 30_000, // 30s budget
+          maxIterations: 5,
+          timeBudgetMs: 30_000,
         });
 
         if (response && response.length > 0) {
