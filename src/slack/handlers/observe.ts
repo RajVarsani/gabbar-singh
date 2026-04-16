@@ -5,7 +5,12 @@ import { saveMemory } from "../../memory/episodic.js";
 import { getCoreMemory, formatCoreMemory } from "../../memory/core.js";
 import { recallMemories } from "../../memory/episodic.js";
 import { postMessage } from "../client.js";
-import { redisGet, redisSet } from "../../store/redis.js";
+import {
+  redisGet,
+  redisSet,
+  getThreadHistory,
+  appendToThread,
+} from "../../store/redis.js";
 import { log } from "../../log.js";
 
 type ChannelEvent = {
@@ -20,13 +25,20 @@ const EXTRACT_PROMPT = `extract one factual memory from this slack message. resp
 {"fact": "...", "tags": ["tag1", "tag2"]}
 if nothing worth remembering, respond with: null`;
 
-const PROACTIVE_COOLDOWN = 600; // 10 minutes
+const PROACTIVE_COOLDOWN = 300; // 5 minutes
 
 function extractTags(text: string): string[] {
   const words = text.toLowerCase().split(/\s+/);
   return words
     .filter((w) => w.length > 3)
-    .filter((w) => !["what", "when", "where", "which", "that", "this", "have", "been", "will", "from", "they", "their", "about", "would", "could", "should"].includes(w))
+    .filter(
+      (w) =>
+        ![
+          "what", "when", "where", "which", "that", "this",
+          "have", "been", "will", "from", "they", "their",
+          "about", "would", "could", "should",
+        ].includes(w)
+    )
     .slice(0, 5);
 }
 
@@ -34,8 +46,16 @@ export async function handleObserve(event: ChannelEvent): Promise<void> {
   const { text, user, channel, thread_ts, ts } = event;
   if (!text || !channel || !ts) return;
 
-  const classification = await classifyEvent(text, user);
-  log("OBSERVE", `classification=${classification} channel=${channel} text="${text.slice(0, 60)}"`);
+  // check if gabbar already participated in this thread
+  const threadTs = thread_ts ?? ts;
+  const threadHistory = await getThreadHistory(channel, threadTs);
+  const gabbarInThread = threadHistory.length > 0;
+
+  const classification = await classifyEvent(text, user, gabbarInThread);
+  log(
+    "OBSERVE",
+    `classification=${classification} inThread=${gabbarInThread} channel=${channel} text="${text.slice(0, 60)}"`
+  );
 
   switch (classification) {
     case "ignore":
@@ -44,7 +64,10 @@ export async function handleObserve(event: ChannelEvent): Promise<void> {
     case "observe": {
       try {
         const result = await quickCall(EXTRACT_PROMPT, `[${user}] ${text}`);
-        const cleaned = result.replace(/```json?\n?/g, "").replace(/```/g, "").trim();
+        const cleaned = result
+          .replace(/```json?\n?/g, "")
+          .replace(/```/g, "")
+          .trim();
         if (cleaned && cleaned !== "null") {
           const parsed = JSON.parse(cleaned);
           if (parsed?.fact && parsed?.tags) {
@@ -58,17 +81,18 @@ export async function handleObserve(event: ChannelEvent): Promise<void> {
     }
 
     case "proactive": {
-      const cooldownKey = `gabbar:cooldown:${channel}`;
-      const existing = await redisGet<number>(cooldownKey);
-      if (existing) {
-        log("OBSERVE", `proactive skipped — cooldown active for ${channel}`);
-        return;
+      // rate limit — but skip cooldown if gabbar is already in the thread
+      if (!gabbarInThread) {
+        const cooldownKey = `gabbar:cooldown:${channel}`;
+        const existing = await redisGet<number>(cooldownKey);
+        if (existing) {
+          log("OBSERVE", `proactive skipped — cooldown active for ${channel}`);
+          return;
+        }
+        await redisSet(cooldownKey, 1, PROACTIVE_COOLDOWN);
       }
-      await redisSet(cooldownKey, 1, PROACTIVE_COOLDOWN);
 
       try {
-        const threadTs_ = thread_ts ?? ts;
-
         const [coreMemory, relevantMemories] = await Promise.all([
           getCoreMemory(),
           recallMemories(extractTags(text)),
@@ -77,21 +101,25 @@ export async function handleObserve(event: ChannelEvent): Promise<void> {
         const systemPrompt = buildSystemPrompt({
           coreMemory: formatCoreMemory(coreMemory),
           relevantMemories: relevantMemories.map((m) => m.fact),
-          triggerType: "proactive",
+          triggerType: gabbarInThread ? "mention" : "proactive",
         });
 
-        log("OBSERVE:PROACTIVE", `channel=${channel} text="${text.slice(0, 80)}"`);
+        log(
+          "OBSERVE:PROACTIVE",
+          `inThread=${gabbarInThread} channel=${channel} text="${text.slice(0, 80)}"`
+        );
 
         const response = await agenticLoop({
           systemPrompt,
           userMessage: text,
-          history: [],
-          maxIterations: 5,
-          timeBudgetMs: 30_000,
+          history: gabbarInThread ? threadHistory : [],
+          maxIterations: gabbarInThread ? 10 : 5,
+          timeBudgetMs: gabbarInThread ? 50_000 : 30_000,
         });
 
         if (response && response.length > 0) {
-          await postMessage(channel, response, threadTs_);
+          await postMessage(channel, response, threadTs);
+          await appendToThread(channel, threadTs, text, response);
         }
       } catch (err) {
         log("OBSERVE:PROACTIVE_ERR", err);

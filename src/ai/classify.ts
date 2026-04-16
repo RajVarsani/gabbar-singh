@@ -3,28 +3,37 @@ import { log } from "../log.js";
 
 export type Classification = "ignore" | "observe" | "proactive";
 
-const CLASSIFY_PROMPT = `you are classifying slack messages for a bot named "gabbar" / "gabbar singh". reply with ONLY one word:
+const CLASSIFY_PROMPT = `you are classifying slack messages for a bot named "gabbar" / "gabbar singh". you will receive the message AND context about whether gabbar was already participating in the thread.
 
-- proactive: ONLY if the message literally contains the word "gabbar" (not as an @mention, just the word). nothing else qualifies.
-- observe: the message contains a technical decision, announcement, deployment info, or useful context worth silently remembering for later
-- ignore: everything else. this is the default. routine conversations, support tickets, questions between coworkers, incidents, bugs — all ignore unless gabbar is mentioned by name.
+reply with ONLY one word:
 
-IMPORTANT: gabbar should NEVER insert himself into conversations he wasn't invited to. if someone is reporting a bug, asking for help, or having a discussion — that is NOT gabbar's business unless they said "gabbar". default to ignore.`;
+- proactive: use this if ANY of these are true:
+  * the message contains the word "gabbar" (not as @mention, just the name)
+  * GABBAR_IN_THREAD is true — gabbar was already part of this thread and the conversation is continuing (someone replied, asked a follow-up, etc.)
+  * someone directly replies to or references something gabbar said earlier
+
+- observe: the message contains a technical decision, deployment, announcement, architecture discussion, or useful context worth silently remembering
+
+- ignore: everything else. routine conversations, support tickets, bug reports, questions between coworkers, greetings, noise. this is the DEFAULT.
+
+CRITICAL: if GABBAR_IN_THREAD is false and the message doesn't mention "gabbar" by name, it is almost always ignore or observe. gabbar does NOT jump into new conversations uninvited.`;
 
 const IGNORE_PATTERNS = /^(ok|lol|lmao|haha|nice|thanks|ty|gg|cool|sure|yep|yea|yeah|nah|nope|:.*:|👍|👎|🎉|✅|❌|\+1|-1)$/i;
 const SHORT_THRESHOLD = 3;
 
 export async function classifyEvent(
   text: string,
-  user?: string
+  user?: string,
+  gabbarInThread: boolean = false
 ): Promise<Classification> {
   if (!text || text.length < SHORT_THRESHOLD) return "ignore";
   if (IGNORE_PATTERNS.test(text.trim())) return "ignore";
 
   try {
+    const contextLine = `GABBAR_IN_THREAD: ${gabbarInThread}`;
     const result = await quickCall(
       CLASSIFY_PROMPT,
-      `[${user ?? "unknown"}] ${text}`
+      `${contextLine}\n[${user ?? "unknown"}] ${text}`
     );
 
     const classification = result.trim().toLowerCase();
