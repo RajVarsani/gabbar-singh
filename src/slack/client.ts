@@ -6,7 +6,15 @@ let _slack: WebClient | null = null;
 
 export function getSlack(): WebClient {
   if (!_slack) {
-    _slack = new WebClient(config.slack.botToken());
+    const token = config.slack.botToken();
+    // gabbar must only have bot-scoped access. reject user tokens (xoxp-)
+    // which would act on behalf of a real user and expose their private data.
+    if (!token.startsWith("xoxb-")) {
+      throw new Error(
+        `SLACK_BOT_TOKEN must be a bot token (xoxb-). got prefix "${token.slice(0, 5)}" — refusing to start.`
+      );
+    }
+    _slack = new WebClient(token);
   }
   return _slack;
 }

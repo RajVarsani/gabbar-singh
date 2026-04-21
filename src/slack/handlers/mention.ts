@@ -5,12 +5,14 @@ import { postMessage, addReaction } from "../client.js";
 import { getCoreMemory, formatCoreMemory } from "../../memory/core.js";
 import { recallMemories } from "../../memory/episodic.js";
 import { extractAndSaveMemories } from "../../memory/extract.js";
+import { config } from "../../config.js";
 import { log } from "../../log.js";
 
 type MentionEvent = {
   text?: string;
   user?: string;
   channel?: string;
+  channel_type?: string;
   thread_ts?: string;
   ts?: string;
 };
@@ -42,10 +44,21 @@ export async function handleMention(event: MentionEvent): Promise<void> {
       recallMemories(extractTags(cleanText)),
     ]);
 
+    const ownerUserId = config.ownerUserId();
     const systemPrompt = buildSystemPrompt({
       coreMemory: formatCoreMemory(coreMemory),
       relevantMemories: relevantMemories.map((m) => m.fact),
       triggerType: "mention",
+      meta: {
+        sender: {
+          userId: user,
+          isOwner: user === ownerUserId,
+          ownerUserId,
+        },
+        channel: { id: channel, type: event.channel_type },
+        threadTs,
+        messageTs: ts,
+      },
     });
 
     log("MENTION", `user=${user} channel=${channel} memories=${relevantMemories.length} text="${cleanText.slice(0, 80)}"`);
@@ -54,6 +67,10 @@ export async function handleMention(event: MentionEvent): Promise<void> {
       systemPrompt,
       userMessage: cleanText,
       history,
+      toolContext: {
+        allowedChannels: [channel],
+        isOwner: user === ownerUserId,
+      },
     });
 
     await postMessage(channel, response, threadTs);

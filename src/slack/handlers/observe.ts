@@ -11,12 +11,14 @@ import {
   getThreadHistory,
   appendToThread,
 } from "../../store/redis.js";
+import { config } from "../../config.js";
 import { log } from "../../log.js";
 
 type ChannelEvent = {
   text?: string;
   user?: string;
   channel?: string;
+  channel_type?: string;
   thread_ts?: string;
   ts?: string;
 };
@@ -42,9 +44,34 @@ function extractTags(text: string): string[] {
     .slice(0, 5);
 }
 
+// rate limits (sliding-window counters in Redis). non-owner senders burn
+// classification + potentially memory-extract budget on every message — cap it.
+const CLASSIFY_RATE_WINDOW = 3600; // 1 hour
+const CLASSIFY_RATE_LIMIT_OWNER = 500;
+const CLASSIFY_RATE_LIMIT_OTHER = 30;
+
+async function shouldClassify(user: string | undefined, isOwner: boolean): Promise<boolean> {
+  if (!user) return false;
+  const key = `gabbar:classify_rate:${user}`;
+  const count = (await redisGet<number>(key)) ?? 0;
+  const limit = isOwner ? CLASSIFY_RATE_LIMIT_OWNER : CLASSIFY_RATE_LIMIT_OTHER;
+  if (count >= limit) {
+    log("OBSERVE:RATE_LIMIT", `user=${user} count=${count} limit=${limit}`);
+    return false;
+  }
+  await redisSet(key, count + 1, CLASSIFY_RATE_WINDOW);
+  return true;
+}
+
 export async function handleObserve(event: ChannelEvent): Promise<void> {
   const { text, user, channel, thread_ts, ts } = event;
   if (!text || !channel || !ts) return;
+
+  const ownerUserId = config.ownerUserId();
+  const isOwner = user === ownerUserId;
+
+  // cap classification calls per-user to prevent api cost abuse
+  if (!(await shouldClassify(user, isOwner))) return;
 
   // check if gabbar already participated in this thread
   const threadTs = thread_ts ?? ts;
@@ -54,7 +81,7 @@ export async function handleObserve(event: ChannelEvent): Promise<void> {
   const classification = await classifyEvent(text, user, gabbarInThread);
   log(
     "OBSERVE",
-    `classification=${classification} inThread=${gabbarInThread} channel=${channel} text="${text.slice(0, 60)}"`
+    `classification=${classification} isOwner=${isOwner} inThread=${gabbarInThread} channel=${channel} user=${user} text="${text.slice(0, 60)}"`
   );
 
   switch (classification) {
@@ -62,6 +89,12 @@ export async function handleObserve(event: ChannelEvent): Promise<void> {
       return;
 
     case "observe": {
+      // only save memories from owner — non-owner messages could be
+      // prompt-injection attempts to poison memory
+      if (!isOwner) {
+        log("OBSERVE:SKIP_SAVE", `non-owner message, not saving memory (user=${user})`);
+        return;
+      }
       try {
         const result = await quickCall(EXTRACT_PROMPT, `[${user}] ${text}`);
         const cleaned = result
@@ -81,6 +114,16 @@ export async function handleObserve(event: ChannelEvent): Promise<void> {
     }
 
     case "proactive": {
+      // hard authorization gate — only owner can trigger proactive responses.
+      // even if someone says "gabbar" in a channel, gabbar only responds to raj.
+      if (!isOwner) {
+        log(
+          "OBSERVE:AUTH",
+          `blocked proactive response to non-owner ${user} in ${channel}`
+        );
+        return;
+      }
+
       // rate limit — but skip cooldown if gabbar is already in the thread
       if (!gabbarInThread) {
         const cooldownKey = `gabbar:cooldown:${channel}`;
@@ -102,6 +145,16 @@ export async function handleObserve(event: ChannelEvent): Promise<void> {
           coreMemory: formatCoreMemory(coreMemory),
           relevantMemories: relevantMemories.map((m) => m.fact),
           triggerType: gabbarInThread ? "mention" : "proactive",
+          meta: {
+            sender: {
+              userId: user,
+              isOwner: true,
+              ownerUserId,
+            },
+            channel: { id: channel, type: event.channel_type },
+            threadTs,
+            messageTs: ts,
+          },
         });
 
         log(
@@ -115,6 +168,10 @@ export async function handleObserve(event: ChannelEvent): Promise<void> {
           history: gabbarInThread ? threadHistory : [],
           maxIterations: gabbarInThread ? 10 : 5,
           timeBudgetMs: gabbarInThread ? 50_000 : 30_000,
+          toolContext: {
+            allowedChannels: [channel],
+            isOwner: true,
+          },
         });
 
         if (response && response.length > 0) {

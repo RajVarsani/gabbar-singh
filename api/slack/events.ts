@@ -8,10 +8,17 @@ export const config = {
   api: { bodyParser: false },
 };
 
-async function getRawBody(req: VercelRequest): Promise<string> {
+// slack events api payloads are small; cap to prevent abuse.
+const MAX_BODY_BYTES = 1_000_000; // 1MB
+
+async function getRawBody(req: VercelRequest): Promise<string | null> {
   const chunks: Buffer[] = [];
+  let size = 0;
   for await (const chunk of req) {
-    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    size += buf.length;
+    if (size > MAX_BODY_BYTES) return null;
+    chunks.push(buf);
   }
   return Buffer.concat(chunks).toString("utf-8");
 }
@@ -25,20 +32,24 @@ export default async function handler(
   }
 
   const rawBody = await getRawBody(req);
-  const payload: SlackEvent = JSON.parse(rawBody);
+  if (rawBody === null) {
+    return res.status(413).json({ error: "payload too large" });
+  }
+
+  let payload: SlackEvent;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return res.status(400).json({ error: "invalid json" });
+  }
 
   // handle slack url verification challenge (before sig check)
   if (payload.type === "url_verification") {
     return res.status(200).json({ challenge: payload.challenge });
   }
 
-  // skip slack retries
-  const retryNum = req.headers["x-slack-retry-num"];
-  if (retryNum) {
-    return res.status(200).json({ ok: true, skipped: "retry" });
-  }
-
-  // verify signature
+  // verify signature FIRST — before any other processing — so unsigned
+  // traffic can't burn resources or hit rate-limit paths.
   const isValid = verifySlackSignature(
     req.headers["x-slack-signature"] as string,
     req.headers["x-slack-request-timestamp"] as string,
@@ -47,6 +58,12 @@ export default async function handler(
 
   if (!isValid) {
     return res.status(401).json({ error: "invalid signature" });
+  }
+
+  // skip slack retries (after sig check — only trusted traffic)
+  const retryNum = req.headers["x-slack-retry-num"];
+  if (retryNum) {
+    return res.status(200).json({ ok: true, skipped: "retry" });
   }
 
   // acknowledge immediately, process async via waitUntil

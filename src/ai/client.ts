@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { config } from "../config.js";
 import { getAllTools, executeToolCall } from "./tools/index.js";
+import type { ToolExecContext } from "./tools/index.js";
 import { log } from "../log.js";
 import type { ConversationMessage } from "../store/redis.js";
 
@@ -22,6 +23,8 @@ export type AgenticOptions = {
   maxIterations?: number;
   timeBudgetMs?: number;
   maxTokens?: number;
+  // guardrails applied to every tool call in this run
+  toolContext?: ToolExecContext;
 };
 
 const DEFAULT_MODEL = "claude-sonnet-4-20250514";
@@ -98,7 +101,8 @@ export async function agenticLoop(opts: AgenticOptions): Promise<string> {
       log("AGENT", `calling tool: ${block.name}`);
       const result = await executeToolCall(
         block.name,
-        block.input as Record<string, any>
+        block.input as Record<string, any>,
+        opts.toolContext
       );
       toolResults.push({
         type: "tool_result",

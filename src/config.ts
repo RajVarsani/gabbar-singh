@@ -16,4 +16,5 @@ export const config = {
     url: () => required("UPSTASH_REDIS_REST_URL"),
     token: () => required("UPSTASH_REDIS_REST_TOKEN"),
   },
+  ownerUserId: () => process.env.OWNER_USER_ID ?? "U08SXQF8RTQ",
 } as const;

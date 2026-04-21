@@ -5,12 +5,14 @@ import { postMessage } from "../client.js";
 import { getCoreMemory, formatCoreMemory } from "../../memory/core.js";
 import { recallMemories } from "../../memory/episodic.js";
 import { extractAndSaveMemories } from "../../memory/extract.js";
+import { config } from "../../config.js";
 import { log } from "../../log.js";
 
 type DMEvent = {
   text?: string;
   user?: string;
   channel?: string;
+  channel_type?: string;
   thread_ts?: string;
   ts?: string;
 };
@@ -36,10 +38,21 @@ export async function handleDM(event: DMEvent): Promise<void> {
       recallMemories(extractTags(text)),
     ]);
 
+    const ownerUserId = config.ownerUserId();
     const systemPrompt = buildSystemPrompt({
       coreMemory: formatCoreMemory(coreMemory),
       relevantMemories: relevantMemories.map((m) => m.fact),
       triggerType: "dm",
+      meta: {
+        sender: {
+          userId: user,
+          isOwner: user === ownerUserId,
+          ownerUserId,
+        },
+        channel: { id: channel, type: event.channel_type ?? "im" },
+        threadTs,
+        messageTs: ts,
+      },
     });
 
     log("DM", `user=${user} memories=${relevantMemories.length} text="${text.slice(0, 80)}"`);
@@ -48,6 +61,10 @@ export async function handleDM(event: DMEvent): Promise<void> {
       systemPrompt,
       userMessage: text,
       history,
+      toolContext: {
+        allowedChannels: [channel],
+        isOwner: user === ownerUserId,
+      },
     });
 
     await postMessage(channel, response, thread_ts ? threadTs : undefined);
